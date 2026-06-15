@@ -280,10 +280,10 @@ async function parseChatRequestBody(
 async function resolveAgentModelBinding(agentId: string): Promise<ResolvedModelBinding | null> {
   const db = getDb();
   const [agentRows] = await db.query(
-    "SELECT model_provider, model_id, model_routing FROM agents WHERE id = ?",
+    "SELECT model_provider, model_id, model_routing, system_prompt FROM agents WHERE id = ?",
     [agentId],
   ) as any;
-  const agent = agentRows[0] as { model_provider?: string; model_id?: string; model_routing?: unknown } | undefined;
+  const agent = agentRows[0] as { model_provider?: string; model_id?: string; model_routing?: unknown; system_prompt?: string | null } | undefined;
   if (!agent?.model_provider || !agent?.model_id) return null;
 
   const [providerRows] = await db.query(
@@ -327,6 +327,7 @@ async function resolveAgentModelBinding(agentId: string): Promise<ResolvedModelB
       models,
     },
     ...(modelRouting ? { modelRouting } : {}),
+    systemPrompt: agent.system_prompt ?? null,
   };
 }
 
@@ -510,6 +511,7 @@ export function registerChatRoutes(
       modelId: modelBinding.modelId,
       modelConfig: modelBinding.modelConfig,
       modelRouting: modelBinding.modelRouting,
+      systemPrompt: modelBinding.systemPrompt ?? undefined,
       turnStartMs,
     });
 
@@ -764,6 +766,7 @@ export function registerChatRoutes(
       modelId: modelBinding.modelId,
       modelConfig: modelBinding.modelConfig,
       modelRouting: modelBinding.modelRouting,
+      systemPrompt: modelBinding.systemPrompt ?? undefined,
     });
 
     if (!result.ok && !resolved) {
