@@ -19,6 +19,7 @@ import { requireAdmin } from "./auth.js";
 import type { RuntimeConnectionMap } from "./runtime-connection.js";
 import { encodeModelRoutingForDb } from "./model-routing-config.js";
 import { encodeToolCapabilitiesForDb } from "../core/tool-capabilities.js";
+import { normalizeIdleTimeoutSec } from "../core/config.js";
 import { safeParseJson } from "../gateway/dialect-helpers.js";
 
 /**
@@ -41,15 +42,6 @@ function decodeAgentRow<T extends Record<string, unknown>>(row: T): T {
   };
 }
 
-/**
- * Coerce an idle-timeout request value to a non-negative integer (seconds).
- * Mirrors the Portal UI input handler. Non-numeric / missing → default 300.
- * 0 (or negative, clamped to 0) means "resident" (never auto-destroy).
- */
-function clampIdleTimeoutSec(v: unknown): number {
-  const n = Math.floor(Number(v));
-  return Number.isFinite(n) ? Math.max(0, n) : 300;
-}
 
 export function registerAgentRoutes(
   router: RestRouter,
@@ -134,7 +126,7 @@ export function registerAgentRoutes(
         toolCapabilities ?? null,
         body.system_prompt ?? null,
         body.is_production ?? 1,
-        clampIdleTimeoutSec(body.idle_timeout_sec),
+        normalizeIdleTimeoutSec(body.idle_timeout_sec),
         body.icon ?? null,
         body.color ?? null,
         auth.userId,
@@ -186,6 +178,28 @@ export function registerAgentRoutes(
     const body = await parseBody<Record<string, unknown>>(req);
     const db = getDb();
 
+    // Capture the current idle window before the update — needed to detect the
+    // resident(0) → finite transition, which (unlike every other transition)
+    // does NOT self-heal: a resident pod never self-destructs, so it never
+    // cold-spawns to pick up the new SICLAW_AGENTBOX_IDLE_TIMEOUT. We terminate
+    // the running box below to force that cold spawn.
+    let oldIdleTimeoutSec: number | null = null;
+    let newIdleTimeoutSec: number | null = null;
+    if ("idle_timeout_sec" in body) {
+      const [cur] = await db.query(
+        "SELECT idle_timeout_sec FROM agents WHERE id = ?",
+        [params.id],
+      ) as any;
+      // Coerce to a number: the column is INT (drivers return a number), but a
+      // stringified "0" would silently dodge the `=== 0` resident check below.
+      // Keep null as null so a missing row can't read as 0 (Number(null) === 0).
+      const raw = cur[0]?.idle_timeout_sec;
+      oldIdleTimeoutSec = raw == null ? null : Number(raw);
+      // Normalize once here and reuse for both the SET clause and the
+      // resident→finite terminate decision below.
+      newIdleTimeoutSec = normalizeIdleTimeoutSec(body.idle_timeout_sec);
+    }
+
     // Build dynamic SET clause
     const fields = [
       "name", "description", "status", "model_provider",
@@ -197,7 +211,9 @@ export function registerAgentRoutes(
     for (const field of fields) {
       if (field in body) {
         setClauses.push(`${field} = ?`);
-        values.push(field === "idle_timeout_sec" ? clampIdleTimeoutSec(body[field]) : body[field]);
+        // newIdleTimeoutSec is non-null here: field === "idle_timeout_sec" implies
+        // "idle_timeout_sec" in body, which is exactly when it was computed above.
+        values.push(field === "idle_timeout_sec" ? newIdleTimeoutSec! : body[field]);
       }
     }
     if ("model_routing" in body) {
@@ -258,6 +274,17 @@ export function registerAgentRoutes(
     // re-fetches its whitelist and invalidates live sessions (mid-turn-safe).
     if (toolCapabilitiesChanged) {
       connectionMap.notify(params.id, "agent.reload", { agentId: params.id, resources: ["tools"] });
+    }
+
+    // Idle window changed from resident (0) → finite: the running box is
+    // resident and will never self-destruct, so it would never cold-spawn to
+    // pick up the new window — the change would silently never take effect.
+    // Terminate the running box so the next message cold-spawns with the new
+    // SICLAW_AGENTBOX_IDLE_TIMEOUT. Other transitions (finite→finite, →0) need
+    // no action: the box self-destructs on its current window and the next
+    // spawn reads the new value, so we don't disrupt a live box for them.
+    if ("idle_timeout_sec" in body && oldIdleTimeoutSec === 0 && (newIdleTimeoutSec ?? 0) > 0) {
+      connectionMap.notify(params.id, "agent.terminate", { agentId: params.id });
     }
   });
 
